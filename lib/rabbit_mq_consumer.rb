@@ -4,9 +4,10 @@ require 'json'
 require_relative 'rabbit_mq_consumer/rabbit_mq_connection'
 
 class RabbitMQConsumer
-  attr_reader :routing_key, :exchange_name, :main_q_name, :delay_q_name, :dlx_name, :dead_q_name, :retry_delay, :max_retries, :connection, :handler
+  attr_reader :routing_key, :exchange_name, :main_q_name, :delay_q_name, :dlx_name, :dead_q_name, :retry_delay, :max_retries,
+              :connection, :handler, :max_threads
 
-  def initialize(exchange_name, routing_key, retry_delay: 10_000, max_retries: 5, &block)
+  def initialize(exchange_name, routing_key, max_threads: 1, retry_delay: 10_000, max_retries: 5, &block)
     @routing_key = routing_key
     @exchange_name = exchange_name              # Основной topic exchange для публикации сообщений от приложений
     @main_q_name = "#{exchange_name}_main_q"    # Основная очередь для обработки сообщений
@@ -15,6 +16,7 @@ class RabbitMQConsumer
     @dead_q_name = "#{exchange_name}_dead_q"    # Очередь "мертвых сообщений" для сообщений, у которых исчерпаны попытки
     @retry_delay = retry_delay                  # Время ожидания перед повторной попыткой обработки сообщения после неудачи(в миллисекундах)
     @max_retries = max_retries                  # Максимальное количество попыток повторной обработки сообщения
+    @max_threads = max_threads
     @connection = RabbitMQConnection.connection
     @handler = block # сохраняем переданный блок
   end
@@ -22,7 +24,7 @@ class RabbitMQConsumer
   def call
     connection.start
     channel = connection.create_channel
-    channel.prefetch(1)
+    channel.prefetch(max_threads)
 
     main_exchange = channel.topic(exchange_name, durable: true)
     dlx_exchange = channel.direct(dlx_name, durable: true)
@@ -45,37 +47,53 @@ class RabbitMQConsumer
     delay_queue.bind(dlx_exchange, routing_key: delay_q_name)
     dead_queue.bind(dlx_exchange, routing_key: dead_q_name)
 
-    puts " [*] Support chat listening on '#{routing_key}'"
+    puts " [*] Listening on routing key: '#{routing_key}', max threads: #{max_threads}"
 
-    begin
-      subscribe(channel, main_queue)
-      loop { sleep 1 }
-    rescue Interrupt
-      connection.close
+    semaphore = SizedQueue.new(max_threads) if max_threads > 1
+
+    main_queue.subscribe(manual_ack: true, block: true) do |delivery_info, properties, payload|
+      if max_threads > 1
+        semaphore << true
+        Thread.new do
+          process_message(channel, delivery_info, properties, payload)
+          semaphore.pop
+        end
+      else
+        process_message(channel, delivery_info, properties, payload)
+      end
     end
+  rescue Interrupt
+    connection.close
   end
 
   private
 
-  def subscribe(channel, queue)
-    queue.subscribe(manual_ack: true, block: false) do |delivery_info, properties, payload|
+  def process_message(channel, delivery_info, properties, payload)
+    begin
       data = JSON.parse(payload)
-      begin
-        # Симуляция ошибки для теста
-        raise 'Simulated error' if data['chat_id'] == 'chat123'
+      handler&.call(data, delivery_info, properties)
+      channel.ack(delivery_info.delivery_tag)
+    rescue StandardError => e
+      handle_error(channel, delivery_info, properties, payload, e)
+    end
+  end
 
-        handler&.call(data, delivery_info, properties)
-        channel.ack(delivery_info.delivery_tag)
-      rescue StandardError => e
-        retry_count = properties.headers&.dig('x-death', 0, 'count').to_i
-        puts "[!] Failed to process message: #{e.message}"
-        puts " [!] Retry attempt: #{retry_count} / #{max_retries}"
-        next channel.nack(delivery_info.delivery_tag, false, false) if retry_count < max_retries # Отправляем в delay через DLX — RabbitMQ сам увеличит x-death
+  def handle_error(channel, delivery_info, properties, payload, error)
+    retry_count = properties.headers&.dig('x-death', 0, 'count').to_i
+    puts "[!] Failed: #{error.message} (attempt #{retry_count + 1}/#{max_retries})"
 
-        channel.default_exchange.publish(payload, routing_key: dead_q_name, persistent: true) # Перемещаем в dead очередь
-        channel.ack(delivery_info.delivery_tag)
-        Rollbar.error(e)
-      end
+    if retry_count >= max_retries
+      # Отправляем в dead_queue
+      channel.default_exchange.publish(
+        payload,
+        routing_key: dead_q_name,
+        persistent: true
+      )
+      Rollbar.error(error) if defined?(Rollbar)
+      channel.ack(delivery_info.delivery_tag)
+    else
+      # Отправляем в DLX -> delay -> main автоматически через nack
+      channel.nack(delivery_info.delivery_tag, false, false)
     end
   end
 end
